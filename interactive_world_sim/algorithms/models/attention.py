@@ -60,7 +60,7 @@ class Attention(nn.Module):
             cuda_device = torch.device("cuda")
             device_properties = torch.cuda.get_device_properties(cuda_device)
 
-            if device_properties.major >= 8 and device_properties.minor == 0:
+            if device_properties.major == 8 and device_properties.minor == 0:
                 print_once(
                     "A100 GPU detected, using flash attention if input tensor is on "
                     "cuda"

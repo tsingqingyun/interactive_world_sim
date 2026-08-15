@@ -41,6 +41,13 @@ class LatentWorldModel(BasePytorchAlgo):
         self.training_stage = cfg.training_stage
         assert self.training_stage in [1, 2, 3], "Invalid training stage"
         self.load_ae = cfg.load_ae if "load_ae" in cfg else None
+        self.keypoint_loss_weight = float(
+            cfg.keypoint_loss_weight if "keypoint_loss_weight" in cfg else 0.0
+        )
+        self.num_keypoints = int(cfg.num_keypoints if "num_keypoints" in cfg else 8)
+        self.keypoint_temperature = float(
+            cfg.keypoint_temperature if "keypoint_temperature" in cfg else 1.0
+        )
         super().__init__(cfg)
         self.normalizer = LinearNormalizer()
         self.validation_step_outputs: list = []
@@ -107,6 +114,14 @@ class LatentWorldModel(BasePytorchAlgo):
             )
         self.encoder = nn.Sequential(*encoder_module_ls)
 
+        self.keypoint_head = None
+        if self.keypoint_loss_weight > 0:
+            self.keypoint_head = nn.Sequential(
+                nn.Conv2d(latent_ch, 64, kernel_size=3, padding=1),
+                nn.SiLU(),
+                nn.Conv2d(64, self.num_keypoints, kernel_size=1),
+            )
+
         # load previous trained model
         if self.load_ae is not None:
             cfg_cp = self.cfg.copy()
@@ -124,6 +139,16 @@ class LatentWorldModel(BasePytorchAlgo):
             if self.training_stage == 3:
                 self.dynamics.load_state_dict(diffae.dynamics.state_dict())
             self.decoder.load_state_dict(diffae.decoder.state_dict())
+            if self.keypoint_head is not None:
+                if diffae.keypoint_head is None:
+                    raise ValueError(
+                        "Loaded checkpoint has no keypoint head, but keypoint loss is enabled"
+                    )
+                self.keypoint_head.load_state_dict(diffae.keypoint_head.state_dict())
+
+        if self.keypoint_head is not None and self.training_stage != 1:
+            for parameter in self.keypoint_head.parameters():
+                parameter.requires_grad_(False)
 
         self.validation_fid_model = (
             FrechetInceptionDistance(feature=64) if "fid" in self.metrics else None
@@ -146,6 +171,10 @@ class LatentWorldModel(BasePytorchAlgo):
                 {"params": self.decoder.parameters(), "lr": self.cfg.lr},
                 {"params": self.encoder.parameters(), "lr": self.cfg.lr},
             ]
+            if self.keypoint_head is not None:
+                param_groups.append(
+                    {"params": self.keypoint_head.parameters(), "lr": self.cfg.lr}
+                )
         elif self.training_stage == 2:
             param_groups = [
                 {"params": self.dynamics.parameters(), "lr": self.cfg.lr},
@@ -190,6 +219,59 @@ class LatentWorldModel(BasePytorchAlgo):
                 "name": "lr_scheduler",
             },
         }
+
+    def _keypoint_loss(
+        self,
+        latent: torch.Tensor,
+        keypoints_uv: torch.Tensor,
+        keypoints_visible: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply spatial soft-argmax and supervise ordered UV coordinates."""
+        if self.keypoint_head is None:
+            raise RuntimeError("Keypoint loss requested without a keypoint head")
+        logits = self.keypoint_head(latent.float())
+        _, _, height, width = logits.shape
+        probabilities = torch.softmax(
+            logits.flatten(2) / self.keypoint_temperature, dim=-1
+        )
+        grid_x = torch.linspace(0.0, 1.0, width, device=latent.device)
+        grid_y = torch.linspace(0.0, 1.0, height, device=latent.device)
+        grid_y, grid_x = torch.meshgrid(grid_y, grid_x, indexing="ij")
+        grid_x = grid_x.flatten().to(probabilities.dtype)
+        grid_y = grid_y.flatten().to(probabilities.dtype)
+        predicted_normalized = torch.stack(
+            [
+                (probabilities * grid_x).sum(dim=-1),
+                (probabilities * grid_y).sum(dim=-1),
+            ],
+            dim=-1,
+        )
+
+        keypoints_uv = keypoints_uv.to(predicted_normalized.dtype)
+        valid = keypoints_visible.bool() & torch.isfinite(keypoints_uv).all(dim=-1)
+        target_normalized = torch.stack(
+            [
+                keypoints_uv[..., 0] / (self.cfg.x_shape[-1] - 1),
+                keypoints_uv[..., 1] / (self.cfg.x_shape[-2] - 1),
+            ],
+            dim=-1,
+        )
+        target_normalized = torch.nan_to_num(target_normalized)
+        point_loss = F.smooth_l1_loss(
+            predicted_normalized, target_normalized, reduction="none"
+        ).mean(dim=-1)
+        if valid.any():
+            loss = point_loss[valid].mean()
+            predicted_uv = predicted_normalized * predicted_normalized.new_tensor(
+                [self.cfg.x_shape[-1] - 1, self.cfg.x_shape[-2] - 1]
+            )
+            pixel_error = torch.linalg.vector_norm(
+                predicted_uv - torch.nan_to_num(keypoints_uv), dim=-1
+            )[valid].mean()
+        else:
+            loss = predicted_normalized.sum() * 0.0
+            pixel_error = predicted_normalized.detach().sum() * 0.0
+        return loss, pixel_error
 
     def encoder_forward(self, obs: torch.Tensor) -> torch.Tensor:
         """Forward pass of the encoder
@@ -352,15 +434,21 @@ class LatentWorldModel(BasePytorchAlgo):
         # (B, T, C, H, W)
         obs_ls = [self.normalizer[k].normalize(batch["obs"][k]) for k in self.obs_keys]
         obs = torch.cat(obs_ls, dim=2)
+        target_obs_dict = batch.get("target_obs", batch["obs"])
+        target_obs_ls = [
+            self.normalizer[k].normalize(target_obs_dict[k]) for k in self.obs_keys
+        ]
+        target_obs = torch.cat(target_obs_ls, dim=2)
         action = self.normalizer["action"].normalize(batch["action"])  # (B, T, A)
 
         obs = obs.float()
+        target_obs = target_obs.float()
         action = action.float()
 
         # compute gt latent
-        xs = obs
-        xs = rearrange(xs, "b t c h w -> (b t) c h w")
-        z_gt = self.encoder_forward(xs)
+        encoder_xs = rearrange(obs, "b t c h w -> (b t) c h w")
+        xs = rearrange(target_obs, "b t c h w -> (b t) c h w")
+        z_gt = self.encoder_forward(encoder_xs)
         z_gt = rearrange(z_gt, "(b t) c h w -> b t c h w", b=obs.shape[0])
 
         if self.training_stage in [1]:
@@ -402,6 +490,14 @@ class LatentWorldModel(BasePytorchAlgo):
             self.validation_metrics["dyn_loss"].append(val_loss)
         else:
             z_seq = z_gt
+
+        if self.keypoint_head is not None and "keypoints_uv" in batch:
+            _, keypoint_error = self._keypoint_loss(
+                rearrange(z_seq, "b t c h w -> (b t) c h w"),
+                rearrange(batch["keypoints_uv"], "b t k d -> (b t) k d"),
+                rearrange(batch["keypoints_visible"], "b t k -> (b t) k"),
+            )
+            self.log(f"{namespace}/keypoint_error_px", keypoint_error)
         z_seq = rearrange(z_seq, "b t c h w -> (b t) c h w")
 
         # render images
@@ -410,7 +506,7 @@ class LatentWorldModel(BasePytorchAlgo):
                 self, z_seq, xs.shape[-1], self.normalizer, num_views=self.num_views
             )
             xs_pred = rearrange(xs_pred, "(b t) c h w -> t b c h w", b=obs.shape[0])
-            xs = torch.cat([batch["obs"][k] for k in self.obs_keys], dim=2)
+            xs = torch.cat([target_obs_dict[k] for k in self.obs_keys], dim=2)
             xs = rearrange(xs, "b t c h w -> t b c h w", b=obs.shape[0])
             xs_pred = xs_pred.detach().cpu()
             xs = xs.detach().cpu()
@@ -500,13 +596,19 @@ class LatentWorldModel(BasePytorchAlgo):
         assert "valid_mask" not in batch
         obs_ls = [self.normalizer[k].normalize(batch["obs"][k]) for k in self.obs_keys]
         obs = torch.cat(obs_ls, dim=2)
+        target_obs_dict = batch.get("target_obs", batch["obs"])
+        target_obs_ls = [
+            self.normalizer[k].normalize(target_obs_dict[k]) for k in self.obs_keys
+        ]
+        target_obs = torch.cat(target_obs_ls, dim=2)
         action = self.normalizer["action"].normalize(batch["action"])  # (B, T, A)
 
         obs = obs.float()
+        target_obs = target_obs.float()
         action = action.float()
 
-        xs = obs  # (B, T, C, H, W)
-        xs = rearrange(xs, "b t c h w -> (b t) c h w")
+        encoder_xs = rearrange(obs, "b t c h w -> (b t) c h w")
+        xs = rearrange(target_obs, "b t c h w -> (b t) c h w")
 
         output_dict = {}
 
@@ -514,7 +616,7 @@ class LatentWorldModel(BasePytorchAlgo):
 
         if self.training_stage == 1:
             # stage 1: train encoder and decoder
-            z = self.encoder_forward(xs)  # (B*T, C, H, W)
+            z = self.encoder_forward(encoder_xs)  # (B*T, C, H, W)
             if self.robust_latent:
                 z += torch.randn_like(z) * 0.02
 
@@ -581,7 +683,19 @@ class LatentWorldModel(BasePytorchAlgo):
                     loss = loss_s
                 loss = loss.mean()
 
-            self.log("training/rec_loss", loss)
+            rec_loss = loss
+            self.log("training/rec_loss", rec_loss)
+            if self.keypoint_head is not None:
+                if "keypoints_uv" not in batch:
+                    raise KeyError("keypoint labels are required when keypoint loss is enabled")
+                keypoint_loss, keypoint_error = self._keypoint_loss(
+                    z,
+                    rearrange(batch["keypoints_uv"], "b t k d -> (b t) k d"),
+                    rearrange(batch["keypoints_visible"], "b t k -> (b t) k"),
+                )
+                loss = rec_loss + self.keypoint_loss_weight * keypoint_loss
+                self.log("training/keypoint_loss", keypoint_loss)
+                self.log("training/keypoint_error_px", keypoint_error)
             output_dict = {
                 "loss": loss,
             }
@@ -589,7 +703,7 @@ class LatentWorldModel(BasePytorchAlgo):
         elif self.training_stage == 2:
             # stage 2: train dynamics
             with torch.no_grad():
-                z = self.encoder_forward(xs)  # (B*T, C, H, W)
+                z = self.encoder_forward(encoder_xs)  # (B*T, C, H, W)
             z = rearrange(z, "(b t) c h w -> t b c h w", b=obs.shape[0])
             action = rearrange(action, "b t a -> t b a")
 
@@ -652,6 +766,17 @@ class LatentWorldModel(BasePytorchAlgo):
                     loss = loss_s
                 loss = loss.mean()
 
+            if self.keypoint_head is not None:
+                if "keypoints_uv" not in batch:
+                    raise KeyError("keypoint labels are required when keypoint loss is enabled")
+                keypoint_loss, keypoint_error = self._keypoint_loss(
+                    rearrange(pred_s, "t b c h w -> (t b) c h w"),
+                    rearrange(batch["keypoints_uv"], "b t k d -> (t b) k d"),
+                    rearrange(batch["keypoints_visible"], "b t k -> (t b) k"),
+                )
+                loss = loss + self.keypoint_loss_weight * keypoint_loss
+                self.log("training/keypoint_loss", keypoint_loss)
+                self.log("training/keypoint_error_px", keypoint_error)
             output_dict["loss"] = loss
 
             self.log("training/loss", output_dict["loss"])
@@ -659,7 +784,7 @@ class LatentWorldModel(BasePytorchAlgo):
                 self.log(f"training/{key}", output_dict[key])
         elif self.training_stage == 3:
             with torch.no_grad():
-                z = self.encoder_forward(xs)  # (B*T, C, H, W)
+                z = self.encoder_forward(encoder_xs)  # (B*T, C, H, W)
                 z += torch.randn_like(z) * 0.02
 
             t, s = self._generate_noise_levels(xs[None], self.dec_infer_steps)  # (1, B)

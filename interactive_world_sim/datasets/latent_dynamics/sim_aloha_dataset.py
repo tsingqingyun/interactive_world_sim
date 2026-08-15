@@ -271,6 +271,32 @@ def load_replay_buffer(
     return replay_buffer
 
 
+def load_keypoint_labels(label_dir: str, split: str) -> ReplayBuffer:
+    """Load compact, frame-aligned PushT keypoint labels into memory."""
+    label_path = os.path.join(label_dir, f"{split}.npz")
+    if not os.path.isfile(label_path):
+        raise FileNotFoundError(f"Missing keypoint labels: {label_path}")
+    with np.load(label_path) as labels:
+        keypoints_uv = labels["keypoints_uv"].astype(np.float32)
+        keypoints_visible = labels["keypoints_visible"].astype(bool)
+        episode_ends = labels["episode_ends"].astype(np.int64)
+    if keypoints_uv.ndim != 3 or keypoints_uv.shape[1:] != (8, 2):
+        raise ValueError(f"Expected keypoints_uv shape (T,8,2), got {keypoints_uv.shape}")
+    if keypoints_visible.shape != keypoints_uv.shape[:2]:
+        raise ValueError(
+            "keypoints_visible must match the first two keypoints_uv dimensions"
+        )
+    return ReplayBuffer(
+        {
+            "data": {
+                "keypoints_uv": keypoints_uv,
+                "keypoints_visible": keypoints_visible,
+            },
+            "meta": {"episode_ends": episode_ends},
+        }
+    )
+
+
 class SimAlohaDataset(BaseImageDataset):
     """A dataset for the real-world data collected on Aloha robot."""
 
@@ -354,6 +380,68 @@ class SimAlohaDataset(BaseImageDataset):
         self.goal_sample = cfg.goal_sample
         self.use_cache = use_cache
         self.resolution = cfg.resolution
+        self.target_dataset_dir = (
+            str(cfg.target_dataset_dir)
+            if "target_dataset_dir" in cfg and cfg.target_dataset_dir
+            else None
+        )
+        self.keypoint_label_dir = (
+            str(cfg.keypoint_label_dir)
+            if "keypoint_label_dir" in cfg and cfg.keypoint_label_dir
+            else None
+        )
+
+        self.target_replay_buffer = None
+        self.target_sampler = None
+        if self.target_dataset_dir is not None:
+            target_train_dir = os.path.join(self.target_dataset_dir, "train")
+            self.target_replay_buffer = load_replay_buffer(
+                target_train_dir, use_cache, shape_meta
+            )
+            self._check_episode_alignment(
+                self.replay_buffer, self.target_replay_buffer, "prediction target"
+            )
+            self.target_sampler = self._make_auxiliary_sampler(
+                self.target_replay_buffer, horizon, keys=self.rgb_keys
+            )
+
+        self.keypoint_replay_buffer = None
+        self.keypoint_sampler = None
+        if self.keypoint_label_dir is not None:
+            self.keypoint_replay_buffer = load_keypoint_labels(
+                self.keypoint_label_dir, "train"
+            )
+            self._check_episode_alignment(
+                self.replay_buffer, self.keypoint_replay_buffer, "keypoint labels"
+            )
+            self.keypoint_sampler = self._make_auxiliary_sampler(
+                self.keypoint_replay_buffer,
+                horizon,
+                keys=["keypoints_uv", "keypoints_visible"],
+            )
+
+    @staticmethod
+    def _check_episode_alignment(
+        source: ReplayBuffer, paired: ReplayBuffer, paired_name: str
+    ) -> None:
+        if not np.array_equal(source.episode_ends[:], paired.episode_ends[:]):
+            raise ValueError(
+                f"{paired_name} episode boundaries do not match the input dataset"
+            )
+
+    def _make_auxiliary_sampler(
+        self, replay_buffer: ReplayBuffer, horizon: int, keys: list[str]
+    ) -> SequenceSampler:
+        return SequenceSampler(
+            replay_buffer=replay_buffer,
+            sequence_length=horizon,
+            pad_before=self.pad_before,
+            pad_after=self.pad_after,
+            episode_mask=np.ones((replay_buffer.n_episodes,), dtype=bool),
+            goal_sample=self.goal_sample,
+            keys=keys,
+            skip_frame=self.skip_frame,
+        )
 
     def get_normalizer(self, mode: str = "none", **kwargs: dict) -> LinearNormalizer:
         """Return a normalizer for the dataset."""
@@ -419,7 +507,85 @@ class SimAlohaDataset(BaseImageDataset):
             keys_to_keep_intermediate=["action"],
         )
         val_set.train_mask = val_mask
+
+        if self.target_dataset_dir is not None:
+            target_val_dir = os.path.join(self.target_dataset_dir, "val")
+            val_set.target_replay_buffer = load_replay_buffer(
+                target_val_dir, use_cache, shape_meta
+            )
+            self._check_episode_alignment(
+                val_set.replay_buffer,
+                val_set.target_replay_buffer,
+                "validation prediction target",
+            )
+            val_set.target_sampler = val_set._make_auxiliary_sampler(
+                val_set.target_replay_buffer,
+                self.val_horizon,
+                keys=self.rgb_keys,
+            )
+
+        if self.keypoint_label_dir is not None:
+            val_set.keypoint_replay_buffer = load_keypoint_labels(
+                self.keypoint_label_dir, "val"
+            )
+            self._check_episode_alignment(
+                val_set.replay_buffer,
+                val_set.keypoint_replay_buffer,
+                "validation keypoint labels",
+            )
+            val_set.keypoint_sampler = val_set._make_auxiliary_sampler(
+                val_set.keypoint_replay_buffer,
+                self.val_horizon,
+                keys=["keypoints_uv", "keypoints_visible"],
+            )
         return val_set
+
+    def _sample_replay_sequence(
+        self,
+        idx: int,
+        replay_buffer: ReplayBuffer,
+        sampler: SequenceSampler,
+    ) -> Dict[str, np.ndarray]:
+        """Sample the same temporal indices from an aligned replay buffer."""
+        if not self.is_val:
+            return sampler.sample_sequence(idx)
+
+        epi_idx = idx * self.skip_idx
+        epi_start = replay_buffer.episode_ends[epi_idx - 1] if epi_idx > 0 else 0
+        epi_end = replay_buffer.episode_ends[epi_idx]
+        seq_end = min(epi_end, epi_start + self.val_horizon)
+        sample: Dict[str, np.ndarray] = {}
+        for key in sampler.keys:
+            value = replay_buffer[key][epi_start:seq_end]
+            if value.shape[0] < self.val_horizon:
+                pad_len = self.val_horizon - value.shape[0]
+                value = np.concatenate(
+                    [value, np.repeat(value[-1:], pad_len, axis=0)], axis=0
+                )
+            if key in sampler.keys_to_keep_intermediate:
+                inter_frames = value.shape[0] // self.skip_frame
+                value_shape = list(value.shape[1:])
+                value_shape[0] *= self.skip_frame
+                value = value.reshape(
+                    inter_frames, self.skip_frame, *value.shape[1:]
+                ).reshape(-1, *value_shape)
+            else:
+                value = value[:: self.skip_frame]
+            sample[key] = value
+            sample[f"{key}_final"] = value[-1]
+        sample["is_early_stop"] = np.asarray(False)
+        sample["rel_stop_idx"] = np.asarray(self.val_horizon - 1)
+        return sample
+
+    def _target_sample_to_obs(
+        self, sample: Dict[str, np.ndarray]
+    ) -> Dict[str, torch.Tensor]:
+        target_obs = {}
+        for key in self.rgb_keys:
+            images = sample[key].astype(np.uint8)
+            images = np.moveaxis(images, -1, 1).astype(np.float32) / 255.0
+            target_obs[key] = torch.from_numpy(images)
+        return target_obs
 
     def _sample_to_data(self, sample: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
         obs_dict = dict()
@@ -490,38 +656,25 @@ class SimAlohaDataset(BaseImageDataset):
         return data
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        if self.is_val:
-            epi_idx = idx * self.skip_idx
-            epi_start = (
-                self.replay_buffer.episode_ends[epi_idx - 1] if epi_idx > 0 else 0
-            )
-            epi_end = self.replay_buffer.episode_ends[epi_idx]
-            val_horizon = self.val_horizon
-            seq_end = min(epi_end, epi_start + val_horizon)
-            sample = dict()
-            for key in self.sampler.keys:
-                sample[key] = self.replay_buffer[key][epi_start:seq_end]
-                if sample[key].shape[0] < val_horizon:
-                    pad_len = val_horizon - sample[key].shape[0]
-                    pad_shape = (pad_len, *np.ones_like(sample[key].shape[1:]).tolist())
-                    sample_pad = np.tile(sample[key][-1:], pad_shape)
-                    sample[key] = np.concatenate([sample[key], sample_pad], axis=0)
-                if key in self.sampler.keys_to_keep_intermediate:
-                    inter_frames = sample[key].shape[0] // self.skip_frame
-                    sample_shape = list(sample[key].shape[1:])
-                    sample_shape[0] = sample_shape[0] * self.skip_frame
-                    sample[key] = sample[key].reshape(
-                        inter_frames, self.skip_frame, *sample[key].shape[1:]
-                    )
-                    sample[key] = sample[key].reshape(-1, *sample_shape)
-                else:
-                    sample[key] = sample[key][:: self.skip_frame]
-                sample[f"{key}_final"] = sample[key][-1]
-                sample["is_early_stop"] = False
-                sample["rel_stop_idx"] = val_horizon - 1
-        else:
-            sample = self.sampler.sample_sequence(idx)
+        sample = self._sample_replay_sequence(idx, self.replay_buffer, self.sampler)
         data = self._sample_to_data(sample)
+
+        if self.target_replay_buffer is not None and self.target_sampler is not None:
+            target_sample = self._sample_replay_sequence(
+                idx, self.target_replay_buffer, self.target_sampler
+            )
+            data["target_obs"] = self._target_sample_to_obs(target_sample)
+
+        if self.keypoint_replay_buffer is not None and self.keypoint_sampler is not None:
+            keypoint_sample = self._sample_replay_sequence(
+                idx, self.keypoint_replay_buffer, self.keypoint_sampler
+            )
+            data["keypoints_uv"] = torch.from_numpy(
+                keypoint_sample["keypoints_uv"].astype(np.float32)
+            )
+            data["keypoints_visible"] = torch.from_numpy(
+                keypoint_sample["keypoints_visible"].astype(bool)
+            )
         return data
 
 

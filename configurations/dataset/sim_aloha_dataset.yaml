@@ -2,6 +2,8 @@ defaults:
   - base_dataset
 
 dataset_dir: data/sim_aloha/transfer_cube_0301
+target_dataset_dir: null
+keypoint_label_dir: null
 horizon: 16
 val_horizon: 16
 aug_mode: none

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import time
 from pathlib import Path
 
 import numpy as np
@@ -23,6 +24,7 @@ def main() -> None:
     parser.add_argument("--test-episodes", type=int, default=200)
     parser.add_argument("--val-episodes", type=int, default=100)
     parser.add_argument("--seed", type=int, default=20260814)
+    parser.add_argument("--max-retries", type=int, default=5)
     args = parser.parse_args()
     if args.train_episodes + args.test_episodes > OFFICIAL_TRAIN_EPISODES:
         raise ValueError("Requested train+test exceeds the official train split")
@@ -61,16 +63,29 @@ def main() -> None:
         if destination.is_file() and destination.stat().st_size > 0:
             return
         filename = f"{source_split}/episode_{episode_id}.hdf5"
-        downloaded = Path(
-            hf_hub_download(
-                repo_id=REPO_ID,
-                filename=filename,
-                repo_type="dataset",
-                local_dir=args.output_root,
-            )
-        )
-        if downloaded.resolve() != destination.resolve():
-            shutil.move(str(downloaded), destination)
+        for attempt in range(1, args.max_retries + 1):
+            try:
+                downloaded = Path(
+                    hf_hub_download(
+                        repo_id=REPO_ID,
+                        filename=filename,
+                        repo_type="dataset",
+                        local_dir=args.output_root,
+                    )
+                )
+                if downloaded.resolve() != destination.resolve():
+                    shutil.move(str(downloaded), destination)
+                return
+            except Exception:
+                if attempt == args.max_retries:
+                    raise
+                delay = min(2 ** (attempt - 1), 30)
+                print(
+                    f"Retrying {filename} in {delay}s "
+                    f"(attempt {attempt + 1}/{args.max_retries})",
+                    flush=True,
+                )
+                time.sleep(delay)
 
     for episode_id in train_ids:
         download("train", episode_id, "train")

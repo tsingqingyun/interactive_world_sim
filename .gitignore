@@ -142,6 +142,7 @@ cython_debug/
 
 # Hydra outputs
 outputs/
+/outputs
 .hydra
 
 /slurm_logs/
