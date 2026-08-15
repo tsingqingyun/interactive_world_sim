@@ -9,6 +9,21 @@ Use the same seed and the same command overrides for each A/B pair. The seeded
 launcher initializes Python, NumPy and Torch before executing the unchanged IWS
 `main.py` entrypoint.
 
+## One-command server launch
+
+From the repository root, the bootstrap script checks disk/GPU access, creates
+or reuses the `iws` conda environment, installs dependencies, downloads and
+materializes the paired datasets, and runs all six stages sequentially:
+
+```bash
+nohup bash scripts/bootstrap_pusht_pair_training.sh \
+  > pusht_pair_training.log 2>&1 & echo $!
+```
+
+Monitor it with `tail -f pusht_pair_training.log`. Completed stages contain a
+`.complete` marker and are reused when the script is launched again. An
+incomplete stage is never overwritten automatically.
+
 Materialize the frozen subset first:
 
 ```bash
