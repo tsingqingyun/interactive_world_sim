@@ -56,15 +56,30 @@ def load_model(ckpt_path: str) -> pl.LightningModule:
     ):
         cfg.algorithm.dynamics.diffusion.sampling_timesteps = 10
     cfg.algorithm.load_ae = None
-    algo = LatentWorldModel.load_from_checkpoint(
-        ckpt_path,
-        cfg=cfg.algorithm,
-        map_location="cuda:0",
-        dtype=dtype,
-        strict=False,
-        weights_only=False,
+    # Interactive rollout does not evaluate FVD/FID/LPIPS. Disable checkpoint
+    # metrics before model construction so their detector weights are not
+    # downloaded or allocated on the GPU.
+    cfg.algorithm.metrics = []
+    algo = LatentWorldModel(cfg.algorithm)
+    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    metric_prefixes = (
+        "validation_fid_model.",
+        "validation_fvd_model.",
+        "validation_lpips_model.",
     )
-    algo.dynamics = algo.dynamics.to(dtype)
+    state_dict = {
+        key: value
+        for key, value in checkpoint["state_dict"].items()
+        if not key.startswith(metric_prefixes)
+    }
+    incompatible = algo.load_state_dict(state_dict, strict=False)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "Unexpected inference checkpoint mismatch: "
+            f"missing={incompatible.missing_keys}, "
+            f"unexpected={incompatible.unexpected_keys}"
+        )
+    algo = algo.to(device="cuda:0", dtype=dtype)
     algo.eval()
     algo.dynamics.eval()
     return algo
