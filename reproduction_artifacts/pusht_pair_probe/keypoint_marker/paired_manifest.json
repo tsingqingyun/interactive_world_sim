@@ -1,0 +1,22 @@
+{
+  "contract": "same source episodes; A=RGB; B=RGB+8 oracle keypoint markers",
+  "camera": "top_pov",
+  "marker_radius_px": 3,
+  "dataset_a": "reproduction_artifacts/pusht_pair_probe/rgb",
+  "dataset_b": "reproduction_artifacts/pusht_pair_probe/keypoint_marker",
+  "episodes": [
+    {
+      "source": "data/mujoco/official_probe/train/episode_0.hdf5",
+      "rgb": "reproduction_artifacts/pusht_pair_probe/rgb/train/episode_0.hdf5",
+      "marker": "reproduction_artifacts/pusht_pair_probe/keypoint_marker/train/episode_0.hdf5",
+      "source_sha256": "254203cb13418077bcb870644313ab03098a24e25ce065b988317393c693aff1",
+      "rgb_file_sha256": "254203cb13418077bcb870644313ab03098a24e25ce065b988317393c693aff1",
+      "rgb_trajectory_sha256": "a561d77ddb0e165c4eed0f267cd23ccdc3a61ab00bb9e8cfb81c11b133d72221",
+      "marker_trajectory_sha256": "a561d77ddb0e165c4eed0f267cd23ccdc3a61ab00bb9e8cfb81c11b133d72221",
+      "frames": 300,
+      "visible_keypoints": 2400,
+      "total_keypoints": 2400,
+      "marker_mask_pixels": 69600
+    }
+  ]
+}

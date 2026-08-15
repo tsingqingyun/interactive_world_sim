@@ -1,0 +1,93 @@
+{
+  "evidence_class": "synthetic checkpoint smoke test; not real dataset evidence",
+  "seed": 20260814,
+  "device": "cpu",
+  "torch_version": "2.7.1+cu126",
+  "checkpoint": {
+    "path": "outputs/pusht_cam1/checkpoints/best.ckpt",
+    "bytes": 383346529,
+    "sha256": "a482b24564b039b1fb06da68e3bcf5f31b27508a0ea2e2bb200f7322008241e2"
+  },
+  "model_parameters": 33444095,
+  "obs_keys": [
+    "camera_1_color"
+  ],
+  "action": {
+    "shape": [
+      1,
+      2,
+      4
+    ],
+    "finite": true,
+    "min": 0.0,
+    "max": 0.0,
+    "mean": 0.0,
+    "std": 0.0
+  },
+  "input": {
+    "shape": [
+      1,
+      3,
+      128,
+      128
+    ],
+    "finite": true,
+    "min": 0.0,
+    "max": 1.0,
+    "mean": 0.4999999701976776,
+    "std": 0.2655927240848541
+  },
+  "latent": {
+    "shape": [
+      1,
+      1,
+      4,
+      32,
+      32
+    ],
+    "finite": true,
+    "min": -0.7186220288276672,
+    "max": 0.7734106779098511,
+    "mean": 0.1690029501914978,
+    "std": 0.47062939405441284
+  },
+  "predicted_latent": {
+    "shape": [
+      1,
+      1,
+      4,
+      32,
+      32
+    ],
+    "finite": true,
+    "min": -0.6681443452835083,
+    "max": 0.7857686281204224,
+    "mean": 0.16682469844818115,
+    "std": 0.47140616178512573
+  },
+  "prediction": {
+    "shape": [
+      1,
+      3,
+      128,
+      128
+    ],
+    "finite": true,
+    "min": 0.0,
+    "max": 0.7139014005661011,
+    "mean": 0.4540799558162689,
+    "std": 0.19617648422718048
+  },
+  "timings_seconds": {
+    "load": 0.44278992200270295,
+    "encode": 0.019875422003678977,
+    "dynamics": 0.08406616499996744,
+    "decode": 1.4918593380134553
+  },
+  "artifacts": {
+    "input_png": "reproduction_artifacts/pusht_synthetic_smoke/synthetic_input.png",
+    "input_png_sha256": "5fb3b456921000a6462a0281f8d05a2f5be91fa45ab7b508d747add78b94f699",
+    "prediction_png": "reproduction_artifacts/pusht_synthetic_smoke/predicted_next_frame.png",
+    "prediction_png_sha256": "7af9a491fb5226eef19ece816420dc9f5d06e6ef3f6c68c752af7f22e6ad3484"
+  }
+}

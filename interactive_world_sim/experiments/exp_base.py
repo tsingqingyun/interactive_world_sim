@@ -131,7 +131,7 @@ class BaseLightningExperiment(BaseExperiment):
                 shuffle=shuffle,
                 persistent_workers=False,
                 pin_memory=False,
-                prefetch_factor=1,
+                prefetch_factor=(1 if self.cfg.training.data.num_workers > 0 else None),
             )
         else:
             return None
@@ -153,7 +153,9 @@ class BaseLightningExperiment(BaseExperiment):
                 shuffle=shuffle,
                 persistent_workers=False,
                 pin_memory=False,
-                prefetch_factor=1,
+                prefetch_factor=(
+                    1 if self.cfg.validation.data.num_workers > 0 else None
+                ),
             )
         else:
             return None
@@ -175,7 +177,7 @@ class BaseLightningExperiment(BaseExperiment):
                 shuffle=shuffle,
                 persistent_workers=False,
                 pin_memory=False,
-                prefetch_factor=1,
+                prefetch_factor=(1 if self.cfg.test.data.num_workers > 0 else None),
             )
         else:
             return None

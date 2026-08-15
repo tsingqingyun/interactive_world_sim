@@ -1,0 +1,30 @@
+{
+  "evidence_class": "pipeline_smoke_only",
+  "date": "2026-08-15",
+  "seed": 20260814,
+  "device": "cpu",
+  "fixture": {
+    "source": "official train/episode_0.hdf5",
+    "frames_per_episode": 300,
+    "warning": "The same episode was copied into train and val; no metric is scientific evidence."
+  },
+  "runs": [
+    {"dataset": "A_rgb", "stage": 1, "output": "outputs/2026-08-15/12-44-56", "global_step": 1},
+    {"dataset": "B_marker", "stage": 1, "output": "outputs/2026-08-15/12-45-16", "global_step": 1},
+    {"dataset": "A_rgb", "stage": 2, "output": "outputs/2026-08-15/12-45-47", "global_step": 1},
+    {"dataset": "B_marker", "stage": 2, "output": "outputs/2026-08-15/12-46-04", "global_step": 1},
+    {"dataset": "A_rgb", "stage": 3, "output": "outputs/2026-08-15/12-46-22", "global_step": 1},
+    {"dataset": "B_marker", "stage": 3, "output": "outputs/2026-08-15/12-48-38", "global_step": 1}
+  ],
+  "checkpoint_contract": {
+    "state_dict_keys_each": 780,
+    "stage2_loads_matching_stage1": true,
+    "stage3_loads_matching_stage2": true
+  },
+  "formal_training_complete": false,
+  "blockers": [
+    "frozen official subset is not downloaded",
+    "outbound dataset download is currently blocked",
+    "CUDA is unavailable to Torch in the current execution context"
+  ]
+}

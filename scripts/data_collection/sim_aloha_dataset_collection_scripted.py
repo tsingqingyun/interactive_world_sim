@@ -16,28 +16,39 @@ The system uses a scripted policy that generates 4 types of motions:
 4. Random exploration (10%): Non-contact exploration motions
 """
 
+# The upstream Gym wrapper exposes MuJoCo state through these private handles.
+# ruff: noqa: SLF001
+
 # %%
 import os
+import random
 import time
-from multiprocessing.managers import SharedMemoryManager
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
+
 import click
 import cv2
+import mujoco
 import numpy as np
 import transforms3d
 from gym_aloha.env import AlohaEnv
+from yixuan_utilities.draw_utils import center_crop
 from yixuan_utilities.hdf5_utils import save_dict_to_hdf5
 from yixuan_utilities.kinematics_helper import KinHelper
-from yixuan_utilities.draw_utils import center_crop
 
-from interactive_world_sim.utils.draw_utils import concat_img_h, concat_img_v, plot_single_3d_pos_traj
-from interactive_world_sim.utils.pose_utils import PoseType, pose_convert
+from interactive_world_sim.utils.draw_utils import plot_single_3d_pos_traj
 from interactive_world_sim.utils.motion_planner import (
     MotionPlanner,
     TShapeInfo,
     WorkspaceConstraints,
-    TGeometryAnalyzer,
+)
+from interactive_world_sim.utils.pose_utils import PoseType, pose_convert
+from interactive_world_sim.utils.pusht_keypoints import (
+    PUSHT_LOCAL_KEYPOINTS,
+    draw_keypoint_markers,
+    make_pusht_marker_observation,
+    project_world_points,
+    pusht_keypoints_world,
 )
 
 
@@ -61,39 +72,12 @@ def extract_t_info(env_state: np.ndarray) -> TShapeInfo:
 
     rotation_angle = np.arctan2(rot_matrix[1, 0], rot_matrix[0, 0])  # -pi/2 to pi/2
 
-    # T-shape dimensions (scaled by 0.6 from XML)
-    original_width = 0.2
-    original_height = 0.2
-    original_thickness = 0.05
-    original_height_2 = 0.04
-    scale = 0.8
-
-    width = original_width * scale
-    height = original_height * scale
-    thickness = original_thickness * scale
-
-    # Generate keypoints (simplified, we'll use geometric calculation)
-    # For now, we'll use dummy keypoints since we don't have the exact mesh info
-    keypoints = np.array(
-        [
-            [-width / 2, thickness / 2, original_height_2],  # top left
-            [width / 2, thickness / 2, original_height_2],  # top right
-            [-width / 2, -thickness / 2, original_height_2],  # top bar bottom side left
-            [width / 2, -thickness / 2, original_height_2],  # top bar bottom side right
-            [-thickness / 2, -thickness / 2, original_height_2],  # stem top left
-            [thickness / 2, -thickness / 2, original_height_2],  # stem top right
-            [
-                -thickness / 2,
-                thickness / 2 - height,
-                original_height_2,
-            ],  # stem bottom left
-            [
-                thickness / 2,
-                thickness / 2 - height,
-                original_height_2,
-            ],  # stem bottom right
-        ]
-    )
+    # Exact scaled mesh bounds: width=0.16 m, height=0.16 m,
+    # thickness=0.04 m and top surface z=0.032 m in the object frame.
+    width = 0.16
+    height = 0.16
+    thickness = 0.04
+    keypoints = PUSHT_LOCAL_KEYPOINTS.copy()
 
     return TShapeInfo(
         center=position[:2],  # Only use x, y
@@ -210,7 +194,9 @@ def init_episode() -> dict:
         "obs": {
             "joint_pos": [],
             "ee_pos": [],
+            "pusht_arm_contact_force": [],
             "images": {},
+            "keypoints": {},
         },
         "action": [],
     }
@@ -229,9 +215,16 @@ def dict_list_to_np(episode: dict) -> dict:
 def save_episode(episode: dict, output_dir: str, episode_id: int) -> None:
     ### create config dict
     config_dict: dict = {
-        "obs": {"images": {}},
+        "obs": {
+            "images": {},
+            "keypoints": {},
+            "pusht_arm_contact_force": {"dtype": "float32"},
+        },
     }
     episode = dict_list_to_np(episode)
+
+    for key, value in episode["obs"]["keypoints"].items():
+        config_dict["obs"]["keypoints"][key] = {"dtype": str(value.dtype)}
 
     # Get first camera name for video saving
     cam_names = list(episode["obs"]["images"].keys())
@@ -249,7 +242,16 @@ def save_episode(episode: dict, output_dir: str, episode_id: int) -> None:
 
     ### save episode data
     episode_path = os.path.join(output_dir, f"episode_{episode_id}.hdf5")
-    save_dict_to_hdf5(episode, config_dict, str(episode_path))
+    attr_dict = {
+        "pusht_keypoint_order": (
+            "top_left,top_right,top_bar_bottom_left,top_bar_bottom_right,"
+            "stem_top_left,stem_top_right,stem_bottom_left,stem_bottom_right"
+        ),
+        "pusht_keypoint_frame": "world_xyz_m; image_uv_col_row_px",
+        "pusht_marker_radius_px": 3,
+        "pusht_marker_observation": "top_pov_keypoint_marker",
+    }
+    save_dict_to_hdf5(episode, config_dict, str(episode_path), attr_dict=attr_dict)
 
     ### save video
     if first_cam_name is not None:
@@ -281,39 +283,47 @@ def visualize_t_keypoints_on_camera(
     img: np.ndarray, obs: dict, env: AlohaEnv, camera_name: str
 ) -> np.ndarray:
     """Visualize T-shape 3D keypoints projected onto camera image."""
-    # Extract T-shape information
-    t_info = extract_t_info(obs["env_state"])
-    t_analyzer = TGeometryAnalyzer(t_info)
-
-    # Get 3D keypoints from T-shape info (these are already in world coordinates)
-    keypoints_3d = t_analyzer.contact_points  # Shape: (N, 3)
-    keypoints_3d = np.concatenate(
-        [keypoints_3d, 0.02 * np.ones((keypoints_3d.shape[0], 1))], axis=-1
-    )
-    world_t_kypts = keypoints_3d
-
-    # Get camera intrinsics and extrinsics
+    keypoints_world = pusht_keypoints_world(obs["env_state"])
     img_shape = img.shape[:2]  # (H, W)
     cam_intrinsics = env.get_cam_intrinsic(camera_name, img_shape)
     cam_extrinsics = env.get_cam_extrinsic(camera_name)
-    cx = cam_intrinsics[0, 2]
-    cy = cam_intrinsics[1, 2]
-    fx = cam_intrinsics[0, 0]
-    fy = cam_intrinsics[1, 1]
-
-    colors = None
-
-    # Project and draw keypoints
-    img = plot_single_3d_pos_traj(
-        img=img.copy(),
-        cam_intrisics=(cx, cy, fx, fy),
-        world_t_cam=cam_extrinsics,
-        trajs=world_t_kypts[None, :],
-        radius=5,
-        colors=colors,
+    keypoints_uv, visible = project_world_points(
+        keypoints_world, cam_intrinsics, cam_extrinsics, img_shape
     )
+    overlay, _ = draw_keypoint_markers(img, keypoints_uv, visible, radius=5)
+    return overlay
 
-    return img
+
+def get_pusht_arm_contact_force(env: AlohaEnv) -> np.ndarray:
+    """Return summed T-contact normal force for the left and right arm in newtons."""
+    physics = env._env.physics
+    model = physics.model._model
+    data = physics.data._data
+    pusht_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "box")
+    arm_force = np.zeros(2, dtype=np.float64)
+    contact_force = np.zeros(6, dtype=np.float64)
+    for contact_idx in range(data.ncon):
+        contact = data.contact[contact_idx]
+        body_1 = int(model.geom_bodyid[contact.geom1])
+        body_2 = int(model.geom_bodyid[contact.geom2])
+        if body_1 == pusht_body_id:
+            arm_body = body_2
+        elif body_2 == pusht_body_id:
+            arm_body = body_1
+        else:
+            continue
+        body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, arm_body)
+        if body_name is None:
+            continue
+        if body_name.startswith("left/"):
+            arm_idx = 0
+        elif body_name.startswith("right/"):
+            arm_idx = 1
+        else:
+            continue
+        mujoco.mj_contactForce(model, data, contact_idx, contact_force)
+        arm_force[arm_idx] += abs(contact_force[0])
+    return arm_force.astype(np.float32)
 
 
 def vis_obs(
@@ -375,7 +385,11 @@ def vis_obs(
 
 
 def update_episode(
-    episode: dict, obs: dict, action: np.ndarray, kin_helper: KinHelper
+    episode: dict,
+    obs: dict,
+    action: np.ndarray,
+    kin_helper: KinHelper,
+    env: AlohaEnv,
 ) -> dict:
     left_base = obs["left_base"][None]
     right_base = obs["right_base"][None]
@@ -386,6 +400,7 @@ def update_episode(
     episode["robot_bases"].append(all_bases)
     episode["env_state"].append(obs["env_state"])
     episode["obs"]["joint_pos"].append(obs["qpos"])
+    episode["obs"]["pusht_arm_contact_force"].append(get_pusht_arm_contact_force(env))
 
     # compute FK for obs
     left_qpos = obs["qpos"][:7]
@@ -407,9 +422,34 @@ def update_episode(
         if camera_name not in episode["obs"]["images"]:
             episode["obs"]["images"][camera_name] = []
         img = obs["images"][camera_name]
-        crop_img = center_crop(img, (128, 128))
-        resize_img = cv2.resize(crop_img, (128, 128), interpolation=cv2.INTER_AREA)
-        episode["obs"]["images"][camera_name].append(resize_img)
+        if camera_name == "top_pov":
+            marker_obs = make_pusht_marker_observation(
+                image=img,
+                env_state=obs["env_state"],
+                camera_intrinsics=env.get_cam_intrinsic(camera_name, img.shape[:2]),
+                world_to_camera=env.get_cam_extrinsic(camera_name),
+            )
+            marker_name = f"{camera_name}_keypoint_marker"
+            episode["obs"]["images"].setdefault(marker_name, []).append(
+                marker_obs.rgb_keypoint_marker
+            )
+            episode["obs"]["images"][camera_name].append(marker_obs.rgb)
+            episode["obs"]["keypoints"].setdefault(f"{camera_name}_uv", []).append(
+                marker_obs.keypoints_uv.astype(np.float32)
+            )
+            episode["obs"]["keypoints"].setdefault(f"{camera_name}_visible", []).append(
+                marker_obs.keypoints_visible.astype(np.uint8)
+            )
+            episode["obs"]["keypoints"].setdefault(f"{camera_name}_world", []).append(
+                marker_obs.keypoints_world.astype(np.float32)
+            )
+            episode["obs"]["keypoints"].setdefault(
+                f"{camera_name}_marker_mask", []
+            ).append(marker_obs.marker_mask)
+        else:
+            crop_img = center_crop(img, (128, 128))
+            resize_img = cv2.resize(crop_img, (128, 128), interpolation=cv2.INTER_AREA)
+            episode["obs"]["images"][camera_name].append(resize_img)
 
     episode["action"].append(action)
 
@@ -434,7 +474,7 @@ def generate_random_init_action(world_t_bases: np.ndarray) -> np.ndarray:
 
 def task_reset(
     env: AlohaEnv,
-    episode_id: int,
+    reset_seed: int,
     kin_helper: KinHelper,
     k_p: float,
     k_v: float,
@@ -442,7 +482,7 @@ def task_reset(
     vel_lim: float,
     headless: bool,
 ) -> None:
-    env.reset(seed=int(time.time()))
+    env.reset(seed=reset_seed)
     obs = env._env.task.get_observation(env._env.physics)
     left_base = obs["left_base"][None]
     right_base = obs["right_base"][None]
@@ -471,7 +511,7 @@ def task_reset(
         env.step(joint_actions)
         obs = env._env.task.get_observation(env._env.physics)
         if not headless:
-            vis_img = vis_obs(obs, episode_id, False, env)
+            vis_img = vis_obs(obs, reset_seed, False, env)
             vis_img = cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR)
             cv2.imshow("Aloha Dataset Collection", vis_img)
             cv2.waitKey(1)
@@ -483,17 +523,43 @@ def task_reset(
 )
 @click.option("--motion_type", "-mt", default="random_no_contact", help="Motion type.")
 @click.option("--headless", "-h", is_flag=True, help="Run in headless mode.")
+@click.option("--seed", type=int, default=20260814, show_default=True)
+@click.option(
+    "--num_episodes",
+    type=click.IntRange(min=0),
+    default=0,
+    show_default=True,
+    help="Number of successful episodes to save; 0 keeps collecting.",
+)
+@click.option(
+    "--max_trials",
+    type=click.IntRange(min=1),
+    default=10000,
+    show_default=True,
+    help="Fail instead of silently retrying forever.",
+)
+@click.option(
+    "--max_plan_attempts",
+    type=click.IntRange(min=1),
+    default=100,
+    show_default=True,
+    help="Maximum initial-state replans for one trajectory.",
+)
 def main(
-    output_dir: str, motion_type: str = "random_no_contact", headless: bool = False
+    output_dir: str,
+    motion_type: str = "random_no_contact",
+    headless: bool = False,
+    seed: int = 20260814,
+    num_episodes: int = 0,
+    max_trials: int = 10000,
+    max_plan_attempts: int = 100,
 ) -> None:
     frequency = 10.0
     dt = 1 / frequency
     Path(output_dir).mkdir(parents=True, exist_ok=True)
+    np.random.seed(seed)
+    random.seed(seed)
     kin_helper = KinHelper(robot_name="trossen_vx300s")
-
-    # enter contexts
-    shm_manager = SharedMemoryManager()
-    shm_manager.__enter__()
 
     curr_vel = np.zeros(6)
     k_p, k_v = 50, 10  # PD control
@@ -504,16 +570,26 @@ def main(
 
     time.sleep(1.0)
     print("Ready!")
-    t_start = time.monotonic()
-    iter_idx = 0
-    episode_id = len(os.listdir(output_dir))
+    existing_ids = [
+        int(path.stem.split("_")[-1])
+        for path in Path(output_dir).glob("episode_*.hdf5")
+    ]
+    episode_id = max(existing_ids, default=-1) + 1
+    failed_dir = Path(output_dir) / "failed"
+    failed_dir.mkdir(parents=True, exist_ok=True)
+    existing_failed_ids = [
+        int(path.stem.split("_")[-1]) for path in failed_dir.glob("episode_*.hdf5")
+    ]
+    failed_episode_id = max(existing_failed_ids, default=-1) + 1
     init_episode_id = episode_id
     stop = False
     is_recording = False
     episode = init_episode()
 
     # sample to a random init action
-    task_reset(env, episode_id, kin_helper, k_p, k_v, acc_lim, vel_lim, headless)
+    reset_idx = 0
+    task_reset(env, seed + reset_idx, kin_helper, k_p, k_v, acc_lim, vel_lim, headless)
+    reset_idx += 1
 
     # Initialize scripted policy components
     workspace_constraints = WorkspaceConstraints(
@@ -524,6 +600,7 @@ def main(
     )
     motion_planner = MotionPlanner(workspace_constraints)
     current_trajectory = None
+    success_fn: Optional[Callable[[np.ndarray, np.ndarray, np.ndarray], bool]] = None
     trajectory_step = 0
 
     # Auto-recording setup
@@ -542,7 +619,7 @@ def main(
 
     while not stop:
         # pump obs
-        obs = env._env.task.get_observation(env._env.physics)  # noqa
+        obs = env._env.task.get_observation(env._env.physics)
 
         # Auto-recording logic
         if auto_record and not is_recording:
@@ -559,6 +636,10 @@ def main(
                 init_pose = env_state_to_mat(episode["env_state"][0])
                 final_pose = env_state_to_mat(episode["env_state"][-1])
                 actions = np.stack(episode["action"])
+                if success_fn is None:
+                    raise RuntimeError(
+                        "Trajectory completed before a success function was set"
+                    )
                 episode_success = success_fn(init_pose, final_pose, actions)
                 if episode_success:
                     print(f"Episode {episode_id} was successful!")
@@ -566,24 +647,41 @@ def main(
                     episode_id += 1
                 else:
                     print(f"Episode {episode_id} was NOT successful!")
+                    save_episode(episode, str(failed_dir), failed_episode_id)
+                    failed_episode_id += 1
                 trial_num += 1
                 print(
                     "Current success rate: ",
                     float(episode_id - init_episode_id) / float(trial_num),
                 )
+                if num_episodes and episode_id - init_episode_id >= num_episodes:
+                    break
+                if trial_num >= max_trials:
+                    env._env.physics.free()
+                    raise RuntimeError(
+                        f"Reached max_trials={max_trials} after saving "
+                        f"{episode_id - init_episode_id} successful episodes"
+                    )
                 episode = init_episode()
                 task_reset(
-                    env, episode_id, kin_helper, k_p, k_v, acc_lim, vel_lim, headless
+                    env,
+                    seed + reset_idx,
+                    kin_helper,
+                    k_p,
+                    k_v,
+                    acc_lim,
+                    vel_lim,
+                    headless,
                 )
+                reset_idx += 1
                 is_recording = False
                 print(
                     f"One episode takes {time.monotonic() - episode_start_time} seconds"
                 )
                 episode_start_time = None
 
-        # visualize
-        vis_img = vis_obs(obs, episode_id, is_recording, env, current_trajectory)
         if not headless:
+            vis_img = vis_obs(obs, episode_id, is_recording, env, current_trajectory)
             vis_img = cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR)
             cv2.imshow("Aloha Dataset Collection", vis_img)
             cv2.waitKey(1)
@@ -594,11 +692,21 @@ def main(
         # Check if we need to generate a new trajectory
         if current_trajectory is None:
             success = False
-            while not success:
+            plan_attempt = 0
+            while not success and plan_attempt < max_plan_attempts:
                 episode = init_episode()
                 task_reset(
-                    env, episode_id, kin_helper, k_p, k_v, acc_lim, vel_lim, headless
+                    env,
+                    seed + reset_idx,
+                    kin_helper,
+                    k_p,
+                    k_v,
+                    acc_lim,
+                    vel_lim,
+                    headless,
                 )
+                reset_idx += 1
+                plan_attempt += 1
                 obs = env._env.task.get_observation(env._env.physics)
 
                 # Extract T-shape information
@@ -612,6 +720,12 @@ def main(
                 # Plan new trajectory
                 current_trajectory, success, success_fn, trajectory_steps = (
                     motion_planner.plan_episode(t_info, current_arm_pos, motion_type)
+                )
+            if not success:
+                env._env.physics.free()
+                raise RuntimeError(
+                    f"Failed to plan {motion_type!r} after "
+                    f"max_plan_attempts={max_plan_attempts}"
                 )
             trajectory_step = 0
 
@@ -640,14 +754,12 @@ def main(
         trajectory_step += 1
 
         if is_recording:
-            episode = update_episode(episode, obs, target_xy_clip, kin_helper)
+            episode = update_episode(episode, obs, target_xy_clip, kin_helper, env)
 
         # execute teleop command
         env.step(puppet_target_state)
-        iter_idx += 1
 
-    # exit contexts
-    shm_manager.__exit__(None, None, None)
+    env._env.physics.free()
 
 
 # %%
